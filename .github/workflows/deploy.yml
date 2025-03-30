@@ -1,0 +1,97 @@
+name: Deploy .NET 8 to Azure VMs with Connection Draining
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  DOTNET_VERSION: '8.0.x'
+  APP_NAME: 'myapp'
+  VM1_IP: '10.0.1.4'
+  VM2_IP: '10.0.1.5'
+  DEPLOY_PATH: 'C:\inetpub\wwwroot\myapp'
+  RESOURCE_GROUP: 'myResourceGroup'
+  LB_NAME: 'myLoadBalancer'
+  BACKEND_POOL: 'myBackendPool'
+
+jobs:
+  build-and-deploy:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v3
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Restore dependencies
+        run: dotnet restore
+
+      - name: Build and Publish
+        run: dotnet publish -c Release -o ./publish
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      # Drain and Deploy to VM1
+      - name: Drain Connections on VM1
+        run: |
+          # Remove VM1 from backend pool
+          az network lb address-pool remove `
+            --resource-group ${{ env.RESOURCE_GROUP }} `
+            --lb-name ${{ env.LB_NAME }} `
+            --name ${{ env.BACKEND_POOL }} `
+            --backend-address vm-name=VM1
+          # Wait for connections to drain
+          Start-Sleep -Seconds 60
+        shell: pwsh
+
+      - name: Deploy to VM1
+        run: |
+          Invoke-AzVMRunCommand -ResourceGroupName ${{ env.RESOURCE_GROUP }} -VMName "VM1" -CommandId "RunPowerShellScript" -ScriptString "iisreset /stop"
+          Copy-AzVMFile -ResourceGroupName ${{ env.RESOURCE_GROUP }} -VMName "VM1" -LocalPath "./publish/*" -RemotePath "${{ env.DEPLOY_PATH }}"
+          Invoke-AzVMRunCommand -ResourceGroupName ${{ env.RESOURCE_GROUP }} -VMName "VM1" -CommandId "RunPowerShellScript" -ScriptString "iisreset /start"
+        shell: pwsh
+
+      - name: Add VM1 Back to Pool
+        run: |
+          az network lb address-pool add `
+            --resource-group ${{ env.RESOURCE_GROUP }} `
+            --lb-name ${{ env.LB_NAME }} `
+            --name ${{ env.BACKEND_POOL }} `
+            --backend-address vm-name=VM1
+        shell: pwsh
+
+      # Drain and Deploy to VM2
+      - name: Drain Connections on VM2
+        run: |
+          az network lb address-pool remove `
+            --resource-group ${{ env.RESOURCE_GROUP }} `
+            --lb-name ${{ env.LB_NAME }} `
+            --name ${{ env.BACKEND_POOL }} `
+            --backend-address vm-name=VM2
+          Start-Sleep -Seconds 60
+        shell: pwsh
+
+      - name: Deploy to VM2
+        run: |
+          Invoke-AzVMRunCommand -ResourceGroupName ${{ env.RESOURCE_GROUP }} -VMName "VM2" -CommandId "RunPowerShellScript" -ScriptString "iisreset /stop"
+          Copy-AzVMFile -ResourceGroupName ${{ env.RESOURCE_GROUP }} -VMName "VM2" -LocalPath "./publish/*" -RemotePath "${{ env.DEPLOY_PATH }}"
+          Invoke-AzVMRunCommand -ResourceGroupName ${{ env.RESOURCE_GROUP }} -VMName "VM2" -CommandId "RunPowerShellScript" -ScriptString "iisreset /start"
+        shell: pwsh
+
+      - name: Add VM2 Back to Pool
+        run: |
+          az network lb address-pool add `
+            --resource-group ${{ env.RESOURCE_GROUP }} `
+            --lb-name ${{ env.LB_NAME }} `
+            --name ${{ env.BACKEND_POOL }} `
+            --backend-address vm-name=VM2
+        shell: pwsh
